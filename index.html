@@ -52,6 +52,7 @@ const sfx = {
   wordComplete() { playTone(400, 800, 200, 'sine', 0.10); },
   zombieHit()    { playTone(100, 80, 100, 'sawtooth', 0.12); },
   gameOver()     { playTone(600, 100, 500, 'sawtooth', 0.15); },
+  wrongKey()     { playTone(200, 200, 50, 'sawtooth', 0.05); },
 };
 
 // --- Word lists by difficulty --------------------------------------------
@@ -99,7 +100,55 @@ let waveZombiesSpawned = 0;
 let waveZombiesTotal = 0;
 let waveDelay = 0; // cooldown between spawns
 let waveClearPause = 0; // brief pause between waves
+let shakeTime = 0;
+let shakeIntensity = 0;
+let ambientOsc = null;
+let ambientGain = null;
+let waveClearWave = 0;
+let wrongKeyFlash = 0;
+let isNewHighScore = false;
+let bestCombo = 0;
 let lastTime = 0;
+
+// --- High score ----------------------------------------------------------
+function loadHighScore() {
+  try { return JSON.parse(localStorage.getItem('typeOrDie_highScore')); } catch { return null; }
+}
+function saveHighScore(s, w) {
+  localStorage.setItem('typeOrDie_highScore', JSON.stringify({ score: s, wave: w }));
+}
+
+// --- Ambient drone -------------------------------------------------------
+function startAmbientDrone() {
+  ambientOsc = audioCtx.createOscillator();
+  ambientGain = audioCtx.createGain();
+  ambientOsc.type = 'sine';
+  ambientOsc.frequency.setValueAtTime(60, audioCtx.currentTime);
+  ambientGain.gain.setValueAtTime(0.03, audioCtx.currentTime);
+  ambientOsc.connect(ambientGain).connect(audioCtx.destination);
+  ambientOsc.start();
+}
+function stopAmbientDrone() {
+  if (ambientOsc) {
+    ambientGain.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.3);
+    ambientOsc.stop(audioCtx.currentTime + 0.3);
+    ambientOsc = null;
+    ambientGain = null;
+  }
+}
+function updateAmbientDrone(w) {
+  if (ambientGain) {
+    const g = Math.min(0.08, 0.03 + (w - 1) * 0.005);
+    ambientGain.gain.setTargetAtTime(g, audioCtx.currentTime, 0.5);
+  }
+}
+
+// --- Wave fanfare --------------------------------------------------------
+function playWaveFanfare() {
+  setTimeout(() => playTone(400, 400, 100, 'sine', 0.08), 0);
+  setTimeout(() => playTone(600, 600, 100, 'sine', 0.08), 120);
+  setTimeout(() => playTone(800, 800, 100, 'sine', 0.08), 240);
+}
 
 // --- Wave configuration --------------------------------------------------
 // Returns spawn config for the current wave number
@@ -165,12 +214,24 @@ function spawnZombie() {
   // Randomize speed a bit so they don't stack
   const speed = cfg.speed * (0.85 + Math.random() * 0.3);
 
+  // Color and size by word difficulty
+  const wLen = word.length;
+  let zColor, zStroke;
+  if (wLen <= 4) { zColor = '#39d353'; zStroke = '#2ea043'; }
+  else if (wLen <= 7) { zColor = '#58a6ff'; zStroke = '#388bfd'; }
+  else if (wLen <= 12) { zColor = '#f85149'; zStroke = '#da3633'; }
+  else { zColor = '#a371f7'; zStroke = '#8957e5'; }
+  const baseRadius = 18 + wLen * 0.5;
+  const zRadius = wLen >= 13 ? baseRadius * 1.2 : baseRadius;
+
   zombies.push({
     x, y, angle, speed, word,
-    typed: 0,   // how many letters have been correctly typed
-    radius: 18,
+    typed: 0,
+    radius: zRadius,
     alive: true,
-    wobble: Math.random() * Math.PI * 2, // animation offset
+    wobble: Math.random() * Math.PI * 2,
+    color: zColor,
+    strokeColor: zStroke,
   });
 }
 
@@ -277,6 +338,10 @@ window.addEventListener('keydown', (e) => {
     typed = '';
     if (lockedZombie && lockedZombie.alive) lockedZombie.typed = 0;
     lockedZombie = null;
+    if (zombies.some(z => z.alive)) {
+      wrongKeyFlash = 0.1;
+      sfx.wrongKey();
+    }
   }
 });
 
@@ -289,9 +354,10 @@ function killZombie(z) {
   const comboBonus = combo * 5;
   score += Math.round(z.word.length * 10 * multiplier + comboBonus);
   combo++;
-  comboTimer = 3; // seconds to maintain combo
+  comboTimer = 3;
+  if (combo > bestCombo) bestCombo = combo;
 
-  burstParticles(z.x, z.y, '#39d353', 18);
+  burstParticles(z.x, z.y, z.color || '#39d353', 18);
 }
 
 // --- Game reset -----------------------------------------------------------
@@ -313,6 +379,11 @@ function restartGame() {
   waveDelay = 0;
   waveClearPause = 0;
   screenFlash = 0;
+  shakeTime = 0;
+  shakeIntensity = 0;
+  wrongKeyFlash = 0;
+  isNewHighScore = false;
+  bestCombo = 0;
 }
 
 // --- Start a new wave -----------------------------------------------------
@@ -332,6 +403,7 @@ function update(dt) {
       countdownValue--;
       if (countdownValue <= 0) {
         state = 'playing';
+        startAmbientDrone();
         startWave();
       }
     }
@@ -348,6 +420,8 @@ function update(dt) {
 
   // Screen flash decay
   if (screenFlash > 0) screenFlash = Math.max(0, screenFlash - dt * 3);
+  if (shakeTime > 0) shakeTime = Math.max(0, shakeTime - dt);
+  if (wrongKeyFlash > 0) wrongKeyFlash = Math.max(0, wrongKeyFlash - dt);
 
   // Wave clear pause (brief breather between waves)
   if (waveClearPause > 0) {
@@ -391,6 +465,8 @@ function update(dt) {
       comboTimer = 0;
       sfx.zombieHit();
       screenFlash = 1;
+      shakeTime = 0.3;
+      shakeIntensity = 5;
       burstParticles(z.x, z.y, '#ff4444', 12);
 
       // If locked zombie died, unlock
@@ -402,6 +478,12 @@ function update(dt) {
       if (lives <= 0) {
         state = 'gameover';
         sfx.gameOver();
+        stopAmbientDrone();
+        const prev = loadHighScore();
+        if (!prev || score > prev.score) {
+          saveHighScore(score, wave);
+          isNewHighScore = true;
+        }
         return;
       }
     }
@@ -422,7 +504,10 @@ function update(dt) {
 
   // Check wave completion
   if (waveZombiesSpawned >= waveZombiesTotal && zombies.length === 0) {
-    waveClearPause = 1.5; // 1.5s breather before next wave
+    waveClearPause = 1.5;
+    waveClearWave = wave;
+    playWaveFanfare();
+    updateAmbientDrone(wave + 1);
   }
 }
 
@@ -437,9 +522,9 @@ function drawZombie(z) {
   // Body (circle)
   ctx.beginPath();
   ctx.arc(zx, zy, z.radius, 0, Math.PI * 2);
-  ctx.fillStyle = '#39d353';
+  ctx.fillStyle = z.color;
   ctx.fill();
-  ctx.strokeStyle = '#2ea043';
+  ctx.strokeStyle = z.strokeColor;
   ctx.lineWidth = 2;
   ctx.stroke();
 
@@ -474,7 +559,7 @@ function drawZombie(z) {
   if (isTarget) {
     const metrics = ctx.measureText(word);
     const w = metrics.width;
-    ctx.strokeStyle = '#39d353';
+    ctx.strokeStyle = z.color;
     ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.moveTo(zx - w / 2, wordY + 4);
@@ -489,7 +574,7 @@ function drawZombie(z) {
   for (let i = 0; i < word.length; i++) {
     const ch = word[i];
     const chWidth = ctx.measureText(ch).width;
-    ctx.fillStyle = i < typedCount ? '#39d353' : '#c9d1d9';
+    ctx.fillStyle = i < typedCount ? z.color : '#c9d1d9';
     ctx.textAlign = 'left';
     ctx.fillText(ch, startX, wordY);
     startX += chWidth;
@@ -521,6 +606,12 @@ function drawHUD() {
   const heartsStr = '\u2764'.repeat(lives);
   ctx.fillStyle = '#ff4444';
   ctx.fillText(heartsStr, canvas.width - 20, 20);
+
+  // Wrong key flash
+  if (wrongKeyFlash > 0) {
+    ctx.fillStyle = `rgba(248, 81, 73, ${wrongKeyFlash * 4})`;
+    ctx.fillRect(canvas.width / 2 - 150, canvas.height - 70, 300, 50);
+  }
 
   // Current typed text — bottom center
   if (typed.length > 0) {
@@ -560,6 +651,16 @@ function drawPlayer() {
   ctx.moveTo(cx - 20 - g, cy); ctx.lineTo(cx - 20 - g - len, cy);
   ctx.moveTo(cx + 20 + g, cy); ctx.lineTo(cx + 20 + g + len, cy);
   ctx.stroke();
+
+  // Combo timer ring
+  if (combo > 0 && comboTimer > 0) {
+    const frac = comboTimer / 3;
+    ctx.beginPath();
+    ctx.arc(cx, cy, 30, -Math.PI / 2, -Math.PI / 2 + frac * Math.PI * 2);
+    ctx.strokeStyle = `rgba(57, 211, 83, ${0.4 + frac * 0.6})`;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
 }
 
 function drawParticles() {
@@ -606,12 +707,20 @@ function drawTitle() {
   ctx.fillStyle = '#8b949e';
   ctx.fillText('Kill zombies by typing their words', cx, cy + 10);
 
+  // High score
+  const hs = loadHighScore();
+  if (hs) {
+    ctx.font = '20px "Courier New", monospace';
+    ctx.fillStyle = '#f0883e';
+    ctx.fillText('HIGH SCORE: ' + hs.score + ' (Wave ' + hs.wave + ')', cx, cy + 45);
+  }
+
   // Prompt
   const blink = Math.sin(performance.now() / 400) > 0;
   if (blink) {
     ctx.font = 'bold 28px "Courier New", monospace';
     ctx.fillStyle = '#c9d1d9';
-    ctx.fillText('PRESS ANY KEY TO START', cx, cy + 80);
+    ctx.fillText('PRESS ANY KEY TO START', cx, cy + (hs ? 100 : 80));
   }
 
   // Zombie deco
@@ -660,16 +769,25 @@ function drawGameOver() {
   ctx.fillText('SCORE: ' + score, cx, cy - 10);
   ctx.fillText('WAVE: ' + wave, cx, cy + 30);
 
-  if (combo > 1) {
+  if (bestCombo > 1) {
     ctx.fillStyle = '#f0883e';
-    ctx.fillText('BEST COMBO: x' + combo, cx, cy + 70);
+    ctx.fillText('BEST COMBO: x' + bestCombo, cx, cy + 70);
+  }
+
+  if (isNewHighScore) {
+    ctx.font = 'bold 32px "Courier New", monospace';
+    ctx.fillStyle = '#f0883e';
+    const pulse = 0.7 + Math.sin(performance.now() / 200) * 0.3;
+    ctx.globalAlpha = pulse;
+    ctx.fillText('NEW HIGH SCORE!', cx, cy + 110);
+    ctx.globalAlpha = 1;
   }
 
   const blink = Math.sin(performance.now() / 400) > 0;
   if (blink) {
     ctx.font = 'bold 24px "Courier New", monospace';
     ctx.fillStyle = '#8b949e';
-    ctx.fillText('PRESS R TO RESTART', cx, cy + 130);
+    ctx.fillText('PRESS R TO RESTART', cx, cy + (isNewHighScore ? 160 : 130));
   }
 }
 
@@ -690,6 +808,15 @@ function gameLoop(timestamp) {
   } else if (state === 'playing') {
     update(dt);
 
+    // Screen shake
+    if (shakeTime > 0) {
+      const decay = shakeTime / 0.3;
+      const sx = (Math.random() * 2 - 1) * shakeIntensity * decay;
+      const sy = (Math.random() * 2 - 1) * shakeIntensity * decay;
+      ctx.save();
+      ctx.translate(sx, sy);
+    }
+
     // Draw subtle grid background
     ctx.strokeStyle = 'rgba(48, 54, 61, 0.3)';
     ctx.lineWidth = 1;
@@ -709,14 +836,23 @@ function gameLoop(timestamp) {
 
     // Wave announcement
     if (waveClearPause > 0) {
-      ctx.font = 'bold 48px "Courier New", monospace';
+      const alpha = Math.min(1, waveClearPause * 2);
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
+      ctx.globalAlpha = alpha;
+
+      ctx.font = 'bold 56px "Courier New", monospace';
       ctx.fillStyle = '#39d353';
-      ctx.globalAlpha = Math.min(1, waveClearPause * 2);
-      ctx.fillText('WAVE ' + (wave + 1), canvas.width / 2, canvas.height / 2 - 80);
+      ctx.fillText('WAVE ' + waveClearWave + ' CLEAR!', canvas.width / 2, canvas.height / 2 - 90);
+
+      ctx.font = '28px "Courier New", monospace';
+      ctx.fillStyle = '#8b949e';
+      ctx.fillText('WAVE ' + (waveClearWave + 1) + ' INCOMING...', canvas.width / 2, canvas.height / 2 - 40);
+
       ctx.globalAlpha = 1;
     }
+
+    if (shakeTime > 0) ctx.restore();
   } else if (state === 'gameover') {
     // Draw final frame underneath
     ctx.strokeStyle = 'rgba(48, 54, 61, 0.3)';
