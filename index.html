@@ -1,0 +1,745 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TYPE OR DIE</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #0d1117; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+// ============================================================
+// TYPE OR DIE — a typing arcade game
+// Single-file, zero dependencies, pure Canvas + Web Audio
+// ============================================================
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+// --- Responsive canvas --------------------------------------------------
+function resize() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// --- Audio (Web Audio API oscillator-based SFX) --------------------------
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+function playTone(freq, endFreq, duration, type = 'square', volume = 0.08) {
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+  if (endFreq !== freq) {
+    osc.frequency.linearRampToValueAtTime(endFreq, audioCtx.currentTime + duration / 1000);
+  }
+  gain.gain.setValueAtTime(volume, audioCtx.currentTime);
+  gain.gain.linearRampToValueAtTime(0, audioCtx.currentTime + duration / 1000);
+  osc.connect(gain).connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + duration / 1000);
+}
+
+const sfx = {
+  keyPress()     { playTone(800, 800, 15, 'square', 0.04); },
+  wordComplete() { playTone(400, 800, 200, 'sine', 0.10); },
+  zombieHit()    { playTone(100, 80, 100, 'sawtooth', 0.12); },
+  gameOver()     { playTone(600, 100, 500, 'sawtooth', 0.15); },
+};
+
+// --- Word lists by difficulty --------------------------------------------
+const WORDS = {
+  easy: [
+    'cat','dog','run','jump','fire','code','bug','ship','type','fast',
+    'slow','help','save','game','play','win','lose','dark','light','hero',
+    'red','box','key','map','sun','moon','star','ice','net','log',
+  ],
+  medium: [
+    'zombie','attack','defend','escape','typing','coding','github','python',
+    'server','deploy','branch','commit','review','sprint','launch','render',
+    'kernel','socket','buffer','cursor','matrix','portal','shield','turret',
+  ],
+  hard: [
+    'algorithm','javascript','typescript','repository','kubernetes',
+    'infrastructure','authentication','vulnerability','microservice',
+    'distributed','asynchronous','polymorphism','serialization','concurrency',
+    'orchestration','encapsulation','idempotent','middleware',
+  ],
+  absurd: [
+    'Eyjafjallajokull','Worcestershire','supercalifragilistic',
+    'pneumonoultramicroscopicsilicovolcanoconiosis',
+    'floccinaucinihilipilification','antidisestablishmentarianism',
+    'honorificabilitudinity','onomatopoeia','sesquipedalian',
+    'incomprehensibilities','psychophysicotherapeutics',
+  ],
+};
+
+// --- Game state -----------------------------------------------------------
+let state = 'title'; // title | countdown | playing | gameover
+let score = 0;
+let lives = 3;
+let wave = 1;
+let zombies = [];
+let particles = [];
+let screenFlash = 0; // red flash alpha when zombie hits player
+let typed = '';       // what the player has typed so far
+let lockedZombie = null; // the zombie currently being targeted
+let combo = 0;
+let comboTimer = 0;
+let countdownValue = 3;
+let countdownTime = 0;
+let waveZombiesSpawned = 0;
+let waveZombiesTotal = 0;
+let waveDelay = 0; // cooldown between spawns
+let waveClearPause = 0; // brief pause between waves
+let lastTime = 0;
+
+// --- Wave configuration --------------------------------------------------
+// Returns spawn config for the current wave number
+function waveConfig(w) {
+  if (w <= 3) {
+    return {
+      pool: 'easy',
+      speed: 18 + w * 3,          // pixels per second
+      count: 2 + w,
+      spawnInterval: 2.5 - w * 0.2,
+    };
+  } else if (w <= 6) {
+    return {
+      pool: 'medium',
+      speed: 28 + (w - 3) * 5,
+      count: 3 + w,
+      spawnInterval: 2.0 - (w - 4) * 0.15,
+    };
+  } else if (w <= 9) {
+    return {
+      pool: 'hard',
+      speed: 38 + (w - 6) * 6,
+      count: 4 + w,
+      spawnInterval: 1.6 - (w - 7) * 0.1,
+    };
+  } else {
+    // Wave 10+: absurd words, lots of fast zombies, mixed pool
+    return {
+      pool: 'absurd',
+      speed: 45 + (w - 9) * 4,
+      count: 6 + w,
+      spawnInterval: Math.max(0.6, 1.4 - (w - 10) * 0.08),
+    };
+  }
+}
+
+function pickWord(pool) {
+  // Waves 7+ mix in some easier words so it isn't wall-to-wall monsters
+  let list = WORDS[pool];
+  if (pool === 'hard' && Math.random() < 0.3) list = WORDS.medium;
+  if (pool === 'absurd' && Math.random() < 0.25) list = WORDS.hard;
+  return list[Math.floor(Math.random() * list.length)];
+}
+
+// --- Zombie factory -------------------------------------------------------
+function spawnZombie() {
+  const cfg = waveConfig(wave);
+  const word = pickWord(cfg.pool);
+
+  // Pick a random edge to spawn from
+  const edge = Math.floor(Math.random() * 4);
+  let x, y;
+  const pad = 40;
+  if (edge === 0) { x = Math.random() * canvas.width; y = -pad; }        // top
+  else if (edge === 1) { x = canvas.width + pad; y = Math.random() * canvas.height; } // right
+  else if (edge === 2) { x = Math.random() * canvas.width; y = canvas.height + pad; } // bottom
+  else { x = -pad; y = Math.random() * canvas.height; }                   // left
+
+  const cx = canvas.width / 2;
+  const cy = canvas.height / 2;
+  const angle = Math.atan2(cy - y, cx - x);
+
+  // Randomize speed a bit so they don't stack
+  const speed = cfg.speed * (0.85 + Math.random() * 0.3);
+
+  zombies.push({
+    x, y, angle, speed, word,
+    typed: 0,   // how many letters have been correctly typed
+    radius: 18,
+    alive: true,
+    wobble: Math.random() * Math.PI * 2, // animation offset
+  });
+}
+
+// --- Particle burst (zombie death) ----------------------------------------
+function burstParticles(x, y, color, count) {
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 60 + Math.random() * 140;
+    particles.push({
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      life: 0.4 + Math.random() * 0.3,
+      maxLife: 0.4 + Math.random() * 0.3,
+      radius: 2 + Math.random() * 3,
+      color,
+    });
+  }
+}
+
+// --- Input handling -------------------------------------------------------
+// We lock onto the closest zombie whose word starts with what we've typed.
+// If no zombie matches, we reset.
+
+window.addEventListener('keydown', (e) => {
+  // Resume AudioContext on first interaction (browser autoplay policy)
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+
+  if (state === 'title') {
+    state = 'countdown';
+    countdownValue = 3;
+    countdownTime = 0;
+    return;
+  }
+
+  if (state === 'gameover') {
+    if (e.key === 'r' || e.key === 'R') restartGame();
+    return;
+  }
+
+  if (state !== 'playing') return;
+
+  // Only care about single printable characters
+  if (e.key.length !== 1) return;
+
+  sfx.keyPress();
+
+  const newTyped = typed + e.key;
+
+  // Try to find a matching zombie
+  // If we already have a locked target, check it first
+  if (lockedZombie && lockedZombie.alive) {
+    const wordLower = lockedZombie.word.toLowerCase();
+    if (wordLower.startsWith(newTyped.toLowerCase())) {
+      typed = newTyped;
+      lockedZombie.typed = typed.length;
+
+      // Check if word complete
+      if (typed.length === lockedZombie.word.length) {
+        killZombie(lockedZombie);
+        typed = '';
+        lockedZombie = null;
+      }
+      return;
+    }
+    // Typed character doesn't match locked zombie — fall through to find new target
+  }
+
+  // Search all zombies for one whose word starts with newTyped
+  // Prefer the closest zombie to the center
+  const cx = canvas.width / 2;
+  const cy = canvas.height / 2;
+  let best = null;
+  let bestDist = Infinity;
+
+  for (const z of zombies) {
+    if (!z.alive) continue;
+    if (z === lockedZombie) continue; // already failed above
+    const wordLower = z.word.toLowerCase();
+    if (wordLower.startsWith(newTyped.toLowerCase())) {
+      const d = Math.hypot(z.x - cx, z.y - cy);
+      if (d < bestDist) {
+        bestDist = d;
+        best = z;
+      }
+    }
+  }
+
+  if (best) {
+    // Unlock previous target
+    if (lockedZombie && lockedZombie.alive) lockedZombie.typed = 0;
+
+    lockedZombie = best;
+    typed = newTyped;
+    lockedZombie.typed = typed.length;
+
+    if (typed.length === lockedZombie.word.length) {
+      killZombie(lockedZombie);
+      typed = '';
+      lockedZombie = null;
+    }
+  } else {
+    // No match at all — reset
+    typed = '';
+    if (lockedZombie && lockedZombie.alive) lockedZombie.typed = 0;
+    lockedZombie = null;
+  }
+});
+
+function killZombie(z) {
+  z.alive = false;
+  sfx.wordComplete();
+
+  // Score: word length * wave multiplier + combo bonus
+  const multiplier = 1 + (wave - 1) * 0.5;
+  const comboBonus = combo * 5;
+  score += Math.round(z.word.length * 10 * multiplier + comboBonus);
+  combo++;
+  comboTimer = 3; // seconds to maintain combo
+
+  burstParticles(z.x, z.y, '#39d353', 18);
+}
+
+// --- Game reset -----------------------------------------------------------
+function restartGame() {
+  state = 'countdown';
+  countdownValue = 3;
+  countdownTime = 0;
+  score = 0;
+  lives = 3;
+  wave = 1;
+  zombies = [];
+  particles = [];
+  typed = '';
+  lockedZombie = null;
+  combo = 0;
+  comboTimer = 0;
+  waveZombiesSpawned = 0;
+  waveZombiesTotal = 0;
+  waveDelay = 0;
+  waveClearPause = 0;
+  screenFlash = 0;
+}
+
+// --- Start a new wave -----------------------------------------------------
+function startWave() {
+  const cfg = waveConfig(wave);
+  waveZombiesSpawned = 0;
+  waveZombiesTotal = cfg.count;
+  waveDelay = 0;
+}
+
+// --- Update loop ----------------------------------------------------------
+function update(dt) {
+  if (state === 'countdown') {
+    countdownTime += dt;
+    if (countdownTime >= 1) {
+      countdownTime -= 1;
+      countdownValue--;
+      if (countdownValue <= 0) {
+        state = 'playing';
+        startWave();
+      }
+    }
+    return;
+  }
+
+  if (state !== 'playing') return;
+
+  // Combo timer decay
+  if (comboTimer > 0) {
+    comboTimer -= dt;
+    if (comboTimer <= 0) { combo = 0; comboTimer = 0; }
+  }
+
+  // Screen flash decay
+  if (screenFlash > 0) screenFlash = Math.max(0, screenFlash - dt * 3);
+
+  // Wave clear pause (brief breather between waves)
+  if (waveClearPause > 0) {
+    waveClearPause -= dt;
+    if (waveClearPause <= 0) {
+      wave++;
+      startWave();
+    }
+    return;
+  }
+
+  // Spawn zombies on a timer
+  const cfg = waveConfig(wave);
+  if (waveZombiesSpawned < waveZombiesTotal) {
+    waveDelay -= dt;
+    if (waveDelay <= 0) {
+      spawnZombie();
+      waveZombiesSpawned++;
+      waveDelay = cfg.spawnInterval;
+    }
+  }
+
+  // Move zombies toward center
+  const cx = canvas.width / 2;
+  const cy = canvas.height / 2;
+  const killRadius = 40; // how close before they "reach" the player
+
+  for (const z of zombies) {
+    if (!z.alive) continue;
+
+    z.x += Math.cos(z.angle) * z.speed * dt;
+    z.y += Math.sin(z.angle) * z.speed * dt;
+    z.wobble += dt * 4;
+
+    const dist = Math.hypot(z.x - cx, z.y - cy);
+    if (dist < killRadius) {
+      // Zombie reached the player
+      z.alive = false;
+      lives--;
+      combo = 0;
+      comboTimer = 0;
+      sfx.zombieHit();
+      screenFlash = 1;
+      burstParticles(z.x, z.y, '#ff4444', 12);
+
+      // If locked zombie died, unlock
+      if (z === lockedZombie) {
+        lockedZombie = null;
+        typed = '';
+      }
+
+      if (lives <= 0) {
+        state = 'gameover';
+        sfx.gameOver();
+        return;
+      }
+    }
+  }
+
+  // Remove dead zombies
+  zombies = zombies.filter(z => z.alive);
+
+  // Update particles
+  for (const p of particles) {
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vx *= 0.96;
+    p.vy *= 0.96;
+    p.life -= dt;
+  }
+  particles = particles.filter(p => p.life > 0);
+
+  // Check wave completion
+  if (waveZombiesSpawned >= waveZombiesTotal && zombies.length === 0) {
+    waveClearPause = 1.5; // 1.5s breather before next wave
+  }
+}
+
+// --- Draw loop ------------------------------------------------------------
+
+function drawZombie(z) {
+  const wobX = Math.sin(z.wobble) * 2;
+  const wobY = Math.cos(z.wobble * 0.7) * 1.5;
+  const zx = z.x + wobX;
+  const zy = z.y + wobY;
+
+  // Body (circle)
+  ctx.beginPath();
+  ctx.arc(zx, zy, z.radius, 0, Math.PI * 2);
+  ctx.fillStyle = '#39d353';
+  ctx.fill();
+  ctx.strokeStyle = '#2ea043';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // Eyes
+  ctx.fillStyle = '#0d1117';
+  ctx.beginPath();
+  ctx.arc(zx - 5, zy - 3, 3, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(zx + 5, zy - 3, 3, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Mouth
+  ctx.beginPath();
+  ctx.arc(zx, zy + 5, 5, 0, Math.PI);
+  ctx.strokeStyle = '#0d1117';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // Word above zombie
+  const word = z.word;
+  const typedCount = z.typed;
+  const fontSize = word.length > 20 ? 18 : word.length > 12 ? 22 : 26;
+  ctx.font = `bold ${fontSize}px "Courier New", monospace`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'bottom';
+
+  const wordY = zy - z.radius - 10;
+
+  // Highlight locked target with underline
+  const isTarget = (z === lockedZombie);
+  if (isTarget) {
+    const metrics = ctx.measureText(word);
+    const w = metrics.width;
+    ctx.strokeStyle = '#39d353';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(zx - w / 2, wordY + 4);
+    ctx.lineTo(zx + w / 2, wordY + 4);
+    ctx.stroke();
+  }
+
+  // Draw word letter by letter so we can color typed vs untyped
+  const fullWidth = ctx.measureText(word).width;
+  let startX = zx - fullWidth / 2;
+
+  for (let i = 0; i < word.length; i++) {
+    const ch = word[i];
+    const chWidth = ctx.measureText(ch).width;
+    ctx.fillStyle = i < typedCount ? '#39d353' : '#c9d1d9';
+    ctx.textAlign = 'left';
+    ctx.fillText(ch, startX, wordY);
+    startX += chWidth;
+  }
+}
+
+function drawHUD() {
+  // Score — top left
+  ctx.font = 'bold 28px "Courier New", monospace';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.fillStyle = '#c9d1d9';
+  ctx.fillText('SCORE ' + score, 20, 20);
+
+  // Wave
+  ctx.font = '20px "Courier New", monospace';
+  ctx.fillText('WAVE ' + wave, 20, 55);
+
+  // Combo
+  if (combo > 1) {
+    ctx.fillStyle = '#f0883e';
+    ctx.fillText('COMBO x' + combo, 20, 80);
+  }
+
+  // Lives — top right
+  ctx.textAlign = 'right';
+  ctx.font = 'bold 28px "Courier New", monospace';
+  ctx.fillStyle = '#c9d1d9';
+  const heartsStr = '\u2764'.repeat(lives);
+  ctx.fillStyle = '#ff4444';
+  ctx.fillText(heartsStr, canvas.width - 20, 20);
+
+  // Current typed text — bottom center
+  if (typed.length > 0) {
+    ctx.font = 'bold 32px "Courier New", monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'bottom';
+    ctx.fillStyle = '#39d353';
+    ctx.fillText(typed, canvas.width / 2, canvas.height - 30);
+  }
+}
+
+function drawPlayer() {
+  const cx = canvas.width / 2;
+  const cy = canvas.height / 2;
+
+  // Crosshair / player indicator
+  ctx.strokeStyle = '#58a6ff';
+  ctx.lineWidth = 2;
+
+  // Outer ring
+  ctx.beginPath();
+  ctx.arc(cx, cy, 20, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // Inner dot
+  ctx.beginPath();
+  ctx.arc(cx, cy, 3, 0, Math.PI * 2);
+  ctx.fillStyle = '#58a6ff';
+  ctx.fill();
+
+  // Cross lines
+  const g = 8;
+  const len = 14;
+  ctx.beginPath();
+  ctx.moveTo(cx, cy - 20 - g); ctx.lineTo(cx, cy - 20 - g - len);
+  ctx.moveTo(cx, cy + 20 + g); ctx.lineTo(cx, cy + 20 + g + len);
+  ctx.moveTo(cx - 20 - g, cy); ctx.lineTo(cx - 20 - g - len, cy);
+  ctx.moveTo(cx + 20 + g, cy); ctx.lineTo(cx + 20 + g + len, cy);
+  ctx.stroke();
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    const alpha = p.life / p.maxLife;
+    ctx.globalAlpha = alpha;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.radius * alpha, 0, Math.PI * 2);
+    ctx.fillStyle = p.color;
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawScreenFlash() {
+  if (screenFlash <= 0) return;
+  // Red vignette on edges
+  const grad = ctx.createRadialGradient(
+    canvas.width / 2, canvas.height / 2, Math.min(canvas.width, canvas.height) * 0.3,
+    canvas.width / 2, canvas.height / 2, Math.max(canvas.width, canvas.height) * 0.7
+  );
+  grad.addColorStop(0, 'rgba(255,0,0,0)');
+  grad.addColorStop(1, `rgba(255,0,0,${screenFlash * 0.4})`);
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+}
+
+function drawTitle() {
+  ctx.fillStyle = '#0d1117';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  const cx = canvas.width / 2;
+  const cy = canvas.height / 2;
+
+  // Title
+  ctx.font = 'bold 72px "Courier New", monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#39d353';
+  ctx.fillText('TYPE OR DIE', cx, cy - 60);
+
+  // Subtitle
+  ctx.font = '24px "Courier New", monospace';
+  ctx.fillStyle = '#8b949e';
+  ctx.fillText('Kill zombies by typing their words', cx, cy + 10);
+
+  // Prompt
+  const blink = Math.sin(performance.now() / 400) > 0;
+  if (blink) {
+    ctx.font = 'bold 28px "Courier New", monospace';
+    ctx.fillStyle = '#c9d1d9';
+    ctx.fillText('PRESS ANY KEY TO START', cx, cy + 80);
+  }
+
+  // Zombie deco
+  const t = performance.now() / 1000;
+  for (let i = 0; i < 6; i++) {
+    const a = (i / 6) * Math.PI * 2 + t * 0.3;
+    const r = 180;
+    const zx = cx + Math.cos(a) * r;
+    const zy = cy + Math.sin(a) * r + 40;
+    ctx.beginPath();
+    ctx.arc(zx, zy, 14, 0, Math.PI * 2);
+    ctx.fillStyle = '#39d353';
+    ctx.globalAlpha = 0.3;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawCountdown() {
+  ctx.fillStyle = '#0d1117';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.font = 'bold 120px "Courier New", monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#39d353';
+  ctx.fillText(countdownValue, canvas.width / 2, canvas.height / 2);
+}
+
+function drawGameOver() {
+  // Dim overlay
+  ctx.fillStyle = 'rgba(13, 17, 23, 0.85)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  const cx = canvas.width / 2;
+  const cy = canvas.height / 2;
+
+  ctx.font = 'bold 64px "Courier New", monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#ff4444';
+  ctx.fillText('GAME OVER', cx, cy - 80);
+
+  ctx.font = '28px "Courier New", monospace';
+  ctx.fillStyle = '#c9d1d9';
+  ctx.fillText('SCORE: ' + score, cx, cy - 10);
+  ctx.fillText('WAVE: ' + wave, cx, cy + 30);
+
+  if (combo > 1) {
+    ctx.fillStyle = '#f0883e';
+    ctx.fillText('BEST COMBO: x' + combo, cx, cy + 70);
+  }
+
+  const blink = Math.sin(performance.now() / 400) > 0;
+  if (blink) {
+    ctx.font = 'bold 24px "Courier New", monospace';
+    ctx.fillStyle = '#8b949e';
+    ctx.fillText('PRESS R TO RESTART', cx, cy + 130);
+  }
+}
+
+// --- Main game loop -------------------------------------------------------
+function gameLoop(timestamp) {
+  const dt = Math.min((timestamp - lastTime) / 1000, 0.05); // cap dt to avoid spiral of death
+  lastTime = timestamp;
+
+  // Clear
+  ctx.fillStyle = '#0d1117';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  if (state === 'title') {
+    drawTitle();
+  } else if (state === 'countdown') {
+    update(dt);
+    drawCountdown();
+  } else if (state === 'playing') {
+    update(dt);
+
+    // Draw subtle grid background
+    ctx.strokeStyle = 'rgba(48, 54, 61, 0.3)';
+    ctx.lineWidth = 1;
+    const gridSize = 60;
+    for (let x = 0; x < canvas.width; x += gridSize) {
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke();
+    }
+    for (let y = 0; y < canvas.height; y += gridSize) {
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
+    }
+
+    drawPlayer();
+    for (const z of zombies) drawZombie(z);
+    drawParticles();
+    drawScreenFlash();
+    drawHUD();
+
+    // Wave announcement
+    if (waveClearPause > 0) {
+      ctx.font = 'bold 48px "Courier New", monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = '#39d353';
+      ctx.globalAlpha = Math.min(1, waveClearPause * 2);
+      ctx.fillText('WAVE ' + (wave + 1), canvas.width / 2, canvas.height / 2 - 80);
+      ctx.globalAlpha = 1;
+    }
+  } else if (state === 'gameover') {
+    // Draw final frame underneath
+    ctx.strokeStyle = 'rgba(48, 54, 61, 0.3)';
+    ctx.lineWidth = 1;
+    const gridSize = 60;
+    for (let x = 0; x < canvas.width; x += gridSize) {
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke();
+    }
+    for (let y = 0; y < canvas.height; y += gridSize) {
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
+    }
+    drawPlayer();
+    for (const z of zombies) drawZombie(z);
+    drawParticles();
+    drawGameOver();
+  }
+
+  requestAnimationFrame(gameLoop);
+}
+
+// Kick off
+lastTime = performance.now();
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
